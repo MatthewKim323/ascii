@@ -3,6 +3,8 @@ import { useEffect, useRef } from 'react'
 /*
  * AsciiField: a scene of cutout layers rendered as live ASCII on a WebGL2 canvas.
  *
+ * A layer is a still (transparent webp/png) or a video (mp4/webm, re-uploaded
+ * every new frame; key out a flat background with `key` when it has no alpha).
  * Every frame the scene (up to 4 textured layers, an optional glow) is
  * evaluated once per grid cell at the cell's center. The cell's luminance
  * picks a glyph off the ramp, the scene color tints it, the background stays
@@ -28,14 +30,26 @@ export type Tint =
   /** the texture's own color */
   | { mode: 'source' }
 
+/** turn part of a layer transparent: footage shot on black, or on a flat screen color */
+export type Key =
+  /** dark is transparent: alpha ramps from 0 at `low` luma to 1 at `high` */
+  | { mode: 'luma'; low?: number; high?: number }
+  /** near `rgb` is transparent: alpha ramps from 0 inside `tol` (rgb distance) to 1 at `tol + soft` */
+  | { mode: 'chroma'; rgb: [number, number, number]; tol?: number; soft?: number }
+
 export type Layer = {
-  /** url of a transparent image (webp/png cutout) */
+  /** url of a transparent image (webp/png cutout) or a video (mp4/webm/mov; treated as video by extension or `video`) */
   src: string
-  /** width in design units; height follows the image aspect */
-  width: number
-  /** pose at timeline start and at the end of the approach */
-  from: Pose
-  to: Pose
+  /** force video handling for urls without a video extension */
+  video?: boolean
+  /** video playback rate (1 is real time) */
+  rate?: number
+  /** width in design units, height follows the source aspect. Default: covers the whole frame */
+  width?: number
+  /** pose at timeline start and at the end of the approach. Default: centered, still */
+  from?: Pose
+  to?: Pose
+  key?: Key
   tint?: Tint
   /** a point of the layer (in its own uv, 0..1) that answers the pointer, e.g. a fingertip */
   anchor?: Vec2
@@ -63,7 +77,8 @@ export type AsciiConfig = {
   ramp: string[]
   layers: Layer[]
   glow?: Glow
-  timeline: {
+  /** pose keyframes; leave out for still layers or plain footage */
+  timeline?: {
     /** seconds of approach + hold before it loops or reverses */
     loop: number
     /** seconds the from->to approach takes inside the loop */
@@ -121,6 +136,8 @@ uniform vec3 u_xf[${MAX_LAYERS}];     // center xy, rotation
 uniform vec2 u_size[${MAX_LAYERS}];   // design units
 uniform vec4 u_tint[${MAX_LAYERS}];   // mode (0 grey, 1 color, 2 source), keep
 uniform vec3 u_mul[${MAX_LAYERS}];
+uniform vec4 u_key[${MAX_LAYERS}];    // mode (0 none, 1 luma, 2 chroma), low/tol, high/soft
+uniform vec3 u_keyRgb[${MAX_LAYERS}];
 
 uniform vec4 u_focus;   // near, far, min, max (max <= 0 disables)
 uniform vec2 u_focusAt;
@@ -142,10 +159,15 @@ vec4 sampleLayer(int i, vec2 p) {
   d = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
   vec2 uv = d / u_size[i] + 0.5;
   if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec4(0.0);
-  if (i == 0) return texture(u_tex0, uv);
-  if (i == 1) return texture(u_tex1, uv);
-  if (i == 2) return texture(u_tex2, uv);
-  return texture(u_tex3, uv);
+  vec4 px;
+  if (i == 0) px = texture(u_tex0, uv);
+  else if (i == 1) px = texture(u_tex1, uv);
+  else if (i == 2) px = texture(u_tex2, uv);
+  else px = texture(u_tex3, uv);
+  vec4 k = u_key[i];
+  if (k.x > 1.5) px.a *= smoothstep(k.y, k.y + k.z, distance(px.rgb, u_keyRgb[i]));
+  else if (k.x > 0.5) px.a *= smoothstep(k.y, k.z, dot(px.rgb, vec3(0.299, 0.587, 0.114)));
+  return px;
 }
 
 vec3 tinted(int i, vec3 rgb) {
@@ -246,12 +268,43 @@ function buildAtlas(ramp: string[], cellPx: number) {
   return canvas
 }
 
-function loadImage(src: string) {
-  return new Promise<HTMLImageElement>((resolve, reject) => {
-    const img = new Image()
-    img.onload = () => resolve(img)
-    img.onerror = reject
-    img.src = src
+type Source = { el: HTMLImageElement | HTMLVideoElement; w: number; h: number; video: HTMLVideoElement | null }
+
+const isVideo = (l: Layer) => l.video ?? /\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(l.src)
+
+function loadSource(l: Layer) {
+  return new Promise<Source>((resolve, reject) => {
+    if (!isVideo(l)) {
+      const img = new Image()
+      img.crossOrigin = 'anonymous'
+      img.onload = () => resolve({ el: img, w: img.naturalWidth, h: img.naturalHeight, video: null })
+      img.onerror = reject
+      img.src = l.src
+      return
+    }
+    // muted + playsInline or mobile browsers refuse to autoplay it
+    const v = document.createElement('video')
+    v.crossOrigin = 'anonymous'
+    v.muted = true
+    v.loop = true
+    v.playsInline = true
+    v.preload = 'auto'
+    v.playbackRate = l.rate ?? 1
+    v.onloadeddata = () => resolve({ el: v, w: v.videoWidth, h: v.videoHeight, video: v })
+    v.onerror = () => reject(new Error(`video failed: ${l.src}`))
+    v.src = l.src
+    v.load()
+  })
+}
+
+/** seek a video and wait until that frame is decoded */
+function seek(v: HTMLVideoElement, t: number) {
+  return new Promise<void>((resolve) => {
+    const d = v.duration || 0
+    const to = d > 0 ? t % d : 0
+    if (Math.abs(v.currentTime - to) < 1e-3 && v.readyState >= 2) return resolve()
+    v.addEventListener('seeked', () => resolve(), { once: true })
+    v.currentTime = to
   })
 }
 
@@ -278,6 +331,7 @@ function upload(gl: WebGL2RenderingContext, src: TexImageSource, unit: number) {
 
 const lerp = (a: number, b: number, k: number) => a + (b - a) * k
 const smooth = (e0: number, e1: number, x: number) => {
+  if (e1 === e0) return x >= e1 ? 1 : 0
   const k = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)))
   return k * k * (3 - 2 * k)
 }
@@ -285,7 +339,8 @@ const dist = (a: Vec2, b: Vec2) => Math.hypot(a[0] - b[0], a[1] - b[1])
 const rotate = ([x, y]: Vec2, r: number): Vec2 => [x * Math.cos(r) - y * Math.sin(r), x * Math.sin(r) + y * Math.cos(r)]
 
 type Xf = [number, number, number]
-const poseAt = (l: Layer, k: number): Xf => [lerp(l.from.x, l.to.x, k), lerp(l.from.y, l.to.y, k), lerp(l.from.rot ?? 0, l.to.rot ?? 0, k)]
+type Placed = Layer & { from: Pose; to: Pose }
+const poseAt = (l: Placed, k: number): Xf => [lerp(l.from.x, l.to.x, k), lerp(l.from.y, l.to.y, k), lerp(l.from.rot ?? 0, l.to.rot ?? 0, k)]
 const pointOf = (xf: Xf, size: Vec2, uv: Vec2): Vec2 => {
   const [ox, oy] = rotate([(uv[0] - 0.5) * size[0], (uv[1] - 0.5) * size[1]], xf[2])
   return [xf[0] + ox, xf[1] + oy]
@@ -315,7 +370,11 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
     const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false })
     if (!gl) return
     const cfg = config
-    const layers = cfg.layers.slice(0, MAX_LAYERS)
+    const center: Pose = { x: cfg.aspect / 2, y: 0.5 }
+    const layers: Placed[] = cfg.layers.slice(0, MAX_LAYERS).map((l) => {
+      const from = l.from ?? l.to ?? center
+      return { ...l, from, to: l.to ?? from }
+    })
     const ix = cfg.interact ?? {}
     const lift = ix.lift ?? 0
     const near = ix.near ?? 0.12
@@ -324,14 +383,18 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
     const rushR = ix.rushRadius ?? 0.22
     const rushK = ix.rush ?? 0
     const scrambleR = ix.scramble ?? 0
-    const { loop, approach, pingPong = true } = cfg.timeline
+    const { loop, approach, pingPong = true } = cfg.timeline ?? { loop: 10, approach: 0 }
 
     let raf = 0
     let disposed = false
     let cleanup = () => {}
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
 
-    Promise.all(layers.map((l) => loadImage(l.src))).then((imgs) => {
+    let videos: HTMLVideoElement[] = []
+    Promise.all(layers.map(loadSource)).then(async (srcs) => {
+      videos = srcs.flatMap((s) => (s.video ? [s.video] : []))
+      // pinned time: show that second of the footage (wraps at its duration); reduced motion: hold the first frame
+      if (time !== undefined) await Promise.all(videos.map((v) => seek(v, time)))
       if (disposed) return
       const prog = gl.createProgram()!
       gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, vert))
@@ -347,9 +410,26 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
       const u = (n: string) => gl.getUniformLocation(prog, n)
 
       // textures: unit 0 is the glyph atlas, layers on 1..4
-      const sizes: Vec2[] = layers.map((l, i) => [l.width, (l.width * imgs[i].height) / imgs[i].width])
-      imgs.forEach((img, i) => upload(gl, img, i + 1))
-      for (let i = 0; i < MAX_LAYERS; i++) gl.uniform1i(u(`u_tex${i}`), Math.min(i, imgs.length - 1) + 1)
+      const sizes: Vec2[] = layers.map((l, i) => {
+        const ar = srcs[i].w / srcs[i].h
+        const w = l.width ?? Math.max(cfg.aspect, ar) // default: cover the frame
+        return [w, w / ar]
+      })
+      const texs = srcs.map((s, i) => upload(gl, s.el, i + 1))
+      for (let i = 0; i < MAX_LAYERS; i++) gl.uniform1i(u(`u_tex${i}`), Math.min(i, srcs.length - 1) + 1)
+      // video layers re-upload only when a new frame was presented (every rAF where unsupported)
+      const fresh = srcs.map(() => true)
+      const vfc: number[] = []
+      srcs.forEach((s, i) => {
+        const v = s.video as (HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number }) | null
+        if (!v?.requestVideoFrameCallback) return
+        const tick = () => {
+          fresh[i] = true
+          if (!disposed) vfc[i] = v.requestVideoFrameCallback!(tick)
+        }
+        vfc[i] = v.requestVideoFrameCallback(tick)
+      })
+      const hasVfc = (i: number) => vfc[i] !== undefined
       gl.uniform1i(u('u_atlas'), 0)
       gl.uniform1i(u('u_count'), layers.length)
       gl.uniform1f(u('u_glyphs'), cfg.ramp.length)
@@ -373,6 +453,17 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
       }
       gl.uniform4fv(u('u_tint'), tintV)
       gl.uniform3fv(u('u_mul'), mulV)
+      const keyV: number[] = []
+      const keyRgb: number[] = []
+      for (let i = 0; i < MAX_LAYERS; i++) {
+        const k = layers[i]?.key
+        if (k?.mode === 'luma') keyV.push(1, k.low ?? 0.04, k.high ?? 0.18, 0)
+        else if (k?.mode === 'chroma') keyV.push(2, k.tol ?? 0.25, k.soft ?? 0.15, 0)
+        else keyV.push(0, 0, 0, 0)
+        keyRgb.push(...(k?.mode === 'chroma' ? k.rgb : [0, 0, 0]))
+      }
+      gl.uniform4fv(u('u_key'), keyV)
+      gl.uniform3fv(u('u_keyRgb'), keyRgb)
       const f = cfg.focus
       gl.uniform4f(u('u_focus'), f?.near ?? 0, f?.far ?? 1, f?.min ?? 1, f ? f.max : 0)
       const g = cfg.glow
@@ -448,11 +539,22 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
         const dt = Math.min(0.1, (now - last) / 1000)
         last = now
         const live = interactive && playingRef.current
+        for (const v of videos) {
+          if (live && v.paused) v.play().catch(() => {})
+          else if (!live && !v.paused) v.pause()
+        }
         if (interactive && !live && drawn) {
           raf = requestAnimationFrame(frame)
           return
         }
         drawn = true
+        srcs.forEach((s, i) => {
+          if (!s.video || s.video.readyState < 2 || (hasVfc(i) && !fresh[i])) return
+          fresh[i] = false
+          gl.activeTexture(gl.TEXTURE0 + i + 1)
+          gl.bindTexture(gl.TEXTURE_2D, texs[i])
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, s.video)
+        })
 
         const span = pingPong ? 2 * loop : loop
         const t0 = time ?? (reduced ? loop - 0.5 : pingPong && clock >= loop ? 2 * loop - clock : clock)
@@ -501,6 +603,10 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
       raf = requestAnimationFrame(frame)
 
       cleanup = () => {
+        srcs.forEach((s, i) => {
+          const v = s.video as (HTMLVideoElement & { cancelVideoFrameCallback?: (h: number) => void }) | null
+          if (v && vfc[i] !== undefined) v.cancelVideoFrameCallback?.(vfc[i])
+        })
         ro.disconnect()
         window.removeEventListener('pointermove', onMove)
         document.documentElement.removeEventListener('pointerleave', onLeave)
@@ -512,6 +618,11 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
       disposed = true
       cancelAnimationFrame(raf)
       cleanup()
+      for (const v of videos) {
+        v.pause()
+        v.removeAttribute('src')
+        v.load()
+      }
     }
   }, [config, time])
 
@@ -540,4 +651,21 @@ export function AsciiField({ config, playing = true, time, className }: Props) {
  * }
  * // keep the config object stable (module scope or useMemo) or the effect rebuilds every render
  * <AsciiField config={ARMS} playing={inView && !document.hidden} />
+ *
+ * Example: your own footage as the whole frame (no poses, no timeline: the video is the motion).
+ *
+ * const CLIP: AsciiConfig = {
+ *   aspect: 16 / 9,
+ *   cell: 1 / 90,
+ *   ramp: [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'],
+ *   layers: [{ src: '/art/clip.mp4', tint: { mode: 'source' } }],
+ *   gamma: 1.4,
+ *   interact: { scramble: 0.14 },
+ * }
+ *
+ * Example: a subject shot on black, keyed out and drifting in like a cutout.
+ *
+ *   layers: [{ src: '/art/dancer.webm', width: 0.9, from: { x: 0.6, y: 0.55 }, to: { x: 0.8, y: 0.5 },
+ *     key: { mode: 'luma', low: 0.05, high: 0.2 }, tint: { mode: 'grey', keep: 0.3 } }],
+ *   timeline: { loop: 8, approach: 5, pingPong: true },
  */

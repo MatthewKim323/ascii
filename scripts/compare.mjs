@@ -39,9 +39,15 @@ if (ref && !fs.existsSync(ref)) {
 }
 fs.mkdirSync(out, { recursive: true })
 
+// resolve playwright from the project being checked (cwd), then from this script's folder
 let chromium
 try {
-  ;({ chromium } = await import('playwright'))
+  const { createRequire } = await import('node:module')
+  const fromCwd = createRequire(path.join(process.cwd(), 'noop.js'))
+  const { pathToFileURL } = await import('node:url')
+  const mod = await import(pathToFileURL(fromCwd.resolve('playwright')).href).catch(() => import('playwright'))
+  chromium = mod.chromium ?? mod.default?.chromium
+  if (!chromium) throw new Error('no chromium export')
 } catch {
   console.error('playwright not found: npm i -D playwright && npx playwright install chromium')
   process.exit(1)
@@ -98,3 +104,4 @@ if (args.hero) {
 await browser.close()
 console.log(`wrote ${out}/ (${pairs.length ? 'pair-*.jpg left=reference right=yours' : 'mine-*.png'})`)
 console.log(errors.length ? `console errors:\n${errors.join('\n')}` : 'no console errors')
+if (errors.length) process.exitCode = 1
