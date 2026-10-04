@@ -62,7 +62,8 @@ is the ramp; merge leftover near-duplicates and drop one-offs), `zoom.png`, `she
 The numbers are starting points measured off the pixels; the steps below are what they mean and how to
 check them by hand when a number looks off (pass `--at <sec>` to measure the grid on a busier second).
 Tested on a real 3696x2304 hero loop: it recovered the exact cell (21/2304) and aspect, the hard-cut loop,
-and the glow window within half a second.
+the glow window within half a second, and every glyph of the ramp (two neighbors of near-equal brightness
+came out swapped, so confirm the order on `zoom.png`).
 
 By hand:
 
